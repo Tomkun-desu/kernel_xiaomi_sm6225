@@ -15,8 +15,8 @@ env:
   ARCH: arm64
   DEVICE: spes
   DEFCONFIG: vendor/spes-perf_defconfig
-  KSU_SETUP_URL: https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/refs/heads/main/kernel/setup.sh
-  KSU_BRANCH: builtin
+  KSU_SETUP_URL: https://raw.githubusercontent.com/Baka-SU/BakaSU/refs/heads/main/kernel/setup.sh
+  KSU_BRANCH: main
   SUSFS_PATCH_URL: https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/mainline/Patches/Patch/susfs_patch_to_4.19.patch
   CLANG_URL: https://github.com/kdrag0n/proton-clang.git
 
@@ -91,7 +91,7 @@ jobs:
           [ -f "$img" ] || img="out/arch/$ARCH/boot/Image.gz"
           cp "$img" ak3/
           cat > ak3/anykernel.sh <<'AK3'
-          kernel.string=SukiSU-Ultra + SUSFS 4.19
+          kernel.string=BakaSU + SUSFS 4.19
           do.devicecheck=0
           do.modules=0
           do.systemless=1
@@ -117,4 +117,4 @@ jobs:
         run: |
           TAG="spes-$(date -u +%Y%m%d-%H%M)-${GITHUB_SHA::7}"
           gh release create "$TAG" "$DEVICE-KSU-SUSFS.zip" --repo "$GITHUB_REPOSITORY" \
-            --title "$TAG" --notes "SukiSU-Ultra $KSU_BRANCH + SUSFS 4.19 floating @ kernel ${GITHUB_SHA::7}"
+            --title "$TAG" --notes "BakaSU $KSU_BRANCH + SUSFS 4.19 floating @ kernel ${GITHUB_SHA::7}"
