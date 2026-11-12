@@ -3,6 +3,11 @@ name: Build spes (BakaSU + SUSFS)
 on:
   workflow_dispatch:
     inputs:
+      release:
+        description: 'Create a GitHub release (otherwise only a workflow artifact)'
+        type: boolean
+        required: false
+        default: false
       susfs_patch_url:
         description: 'SUSFS 4.19 patch URL override (empty = latest upstream mirror)'
         required: false
@@ -57,7 +62,9 @@ jobs:
           echo "$HOME/clang/bin" >> "$GITHUB_PATH"
 
       - name: KernelSU (floating)
-        run: curl -sSL "$KSU_SETUP_URL" | bash -s "$KSU_BRANCH"
+        run: |
+          curl -sSL "$KSU_SETUP_URL" | bash -s "$KSU_BRANCH"
+          echo "KSU_VER=$(git -C KernelSU rev-parse --short HEAD)" >> "$GITHUB_ENV"
 
       - name: SUSFS (floating)
         run: |
@@ -68,6 +75,8 @@ jobs:
           [ -n "$ver" ] || { echo "::error::SUSFS_VERSION not found in patch"; exit 1; }
           [ "$(printf '%s\n%s\n' "$SUSFS_MIN_VERSION" "$ver" | sort -V | head -1)" = "$SUSFS_MIN_VERSION" ] \
             || { echo "::error::SUSFS $ver is older than $SUSFS_MIN_VERSION required by BakaSU"; exit 1; }
+          echo "SUSFS_VER=$ver" >> "$GITHUB_ENV"
+          echo "rejects below are expected: susfs-4.19-compat.patch fixes them"
           git apply --reject /tmp/susfs.patch || true
           # upstream 4.19 patch predates this tree's fs_context mount API and mm backports
           git apply susfs-4.19-compat.patch
@@ -86,6 +95,7 @@ jobs:
       - name: NoMount (floating dev)
         run: |
           curl -fsSL "$NOMOUNT_SETUP_URL" | bash -s
+          echo "NOMOUNT_VER=$(git -C NoMount rev-parse --short HEAD)" >> "$GITHUB_ENV"
           cfg="arch/$ARCH/configs/$DEFCONFIG"
           grep -q '^CONFIG_NOMOUNT=' "$cfg" || echo "CONFIG_NOMOUNT=y" >> "$cfg"
 
@@ -154,7 +164,29 @@ jobs:
           cd ..
           ls -lh "$DEVICE-KSU-SUSFS.zip"
 
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.DEVICE }}-KSU-SUSFS
+          path: ${{ env.DEVICE }}-KSU-SUSFS.zip
+
+      - name: Summary
+        if: always()
+        run: |
+          kver=$(sed -n 's/^#define UTS_RELEASE "\(.*\)"/\1/p' out/include/generated/utsrelease.h 2>/dev/null || true)
+          size=$(du -h "$DEVICE-KSU-SUSFS.zip" 2>/dev/null | cut -f1 || true)
+          {
+            echo "### $DEVICE build"
+            echo ""
+            echo "- kernel: ${kver:-unknown} @ ${GITHUB_SHA::7}"
+            echo "- KernelSU: BakaSU $KSU_BRANCH ${KSU_VER:-unknown}"
+            echo "- SUSFS: v${SUSFS_VER:-unknown} (min $SUSFS_MIN_VERSION)"
+            echo "- NoMount: dev ${NOMOUNT_VER:-unknown}"
+            echo "- artifact: $DEVICE-KSU-SUSFS.zip ${size:-not built}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Release
+        if: inputs.release == true
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
