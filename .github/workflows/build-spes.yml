@@ -41,6 +41,9 @@ env:
   SUSFS_MIN_VERSION: 2.3.00
   SUSFS_PATCH_OVERRIDE: ${{ inputs.susfs_patch_url }}
   ZIP_NAME: spes-BakaSU-SUSFS.zip
+  # every symbol here must exist in BakaSU's Kconfig, otherwise Kconfig drops
+  # it silently and the feature is compiled out while the build stays green
+  SUSFS_CONFIGS: KSU KSU_SUSFS KSU_SUSFS_SUS_PATH KSU_SUSFS_SUS_MOUNT KSU_SUSFS_SUS_KSTAT KSU_SUSFS_SPOOF_UNAME KSU_SUSFS_ENABLE_LOG KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG KSU_SUSFS_OPEN_REDIRECT KSU_SUSFS_SUS_MAP THREAD_INFO_IN_TASK
 
 jobs:
   build:
@@ -117,6 +120,11 @@ jobs:
             echo "::error::inline hook script failed to patch a file"
             exit 1
           fi
+          hook_ver=$(sed -n 's/^PATCH_LEVEL="\([0-9.]*\)".*/\1/p' /tmp/hooks.sh | head -1)
+          [ -n "$hook_ver" ] || { echo "::error::PATCH_LEVEL not found in hooks.sh"; exit 1; }
+          echo "hooks.sh hardcoded minimum: $hook_ver (its 'Current susfs patch version' line is that minimum, not the applied version); applied SUSFS: $SUSFS_VER"
+          [ "$(printf '%s\n%s\n' "$hook_ver" "$SUSFS_VER" | sort -V | head -1)" = "$hook_ver" ] \
+            || { echo "::error::hooks.sh expects SUSFS >= $hook_ver but $SUSFS_VER is applied"; exit 1; }
 
       - name: NoMount (floating dev)
         run: |
@@ -129,10 +137,7 @@ jobs:
       - name: Defconfig
         run: |
           cfg="arch/$ARCH/configs/$DEFCONFIG"
-          for c in KSU KSU_SUSFS KSU_SUSFS_SUS_PATH KSU_SUSFS_SUS_MOUNT KSU_SUSFS_SUS_KSTAT \
-                   KSU_SUSFS_SPOOF_UNAME KSU_SUSFS_ENABLE_LOG KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
-                   KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG KSU_SUSFS_OPEN_REDIRECT KSU_SUSFS_SUS_MAP \
-                   KSU_SUSFS_PRIORITY_UID_FILTER THREAD_INFO_IN_TASK; do
+          for c in $SUSFS_CONFIGS; do
             grep -q "^CONFIG_$c=" "$cfg" || echo "CONFIG_$c=y" >> "$cfg"
           done
           tail -n 20 "$cfg"
@@ -142,8 +147,8 @@ jobs:
           set -o pipefail
           M="O=out ARCH=$ARCH CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
           make $M "$DEFCONFIG"
-          for c in KSU KSU_SUSFS NOMOUNT; do
-            grep -q "^CONFIG_$c=y" out/.config || { echo "::error::CONFIG_$c did not survive Kconfig"; exit 1; }
+          for c in $SUSFS_CONFIGS NOMOUNT; do
+            grep -q "^CONFIG_$c=y" out/.config || { echo "::error::CONFIG_$c did not survive Kconfig (undefined symbol?)"; exit 1; }
           done
           make $M -j"$(nproc)" 2>&1 | tee build.log
 
