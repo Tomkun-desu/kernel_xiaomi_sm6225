@@ -1,7 +1,12 @@
-name: Build spes (SukiSU + SUSFS)
+name: Build spes (BakaSU + SUSFS)
 
 on:
   workflow_dispatch:
+    inputs:
+      susfs_patch_url:
+        description: 'SUSFS 4.19 patch URL override (empty = latest upstream mirror)'
+        required: false
+        default: ''
   push:
     branches: [bka]
     paths: ['.github/workflows/build-spes.yml']
@@ -21,6 +26,9 @@ env:
   CLANG_URL: https://github.com/kdrag0n/proton-clang.git
   HOOKS_URL: https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/mainline/Patches/susfs_inline_hook_patches.sh
   CHIP: khaje
+  NOMOUNT_SETUP_URL: https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/dev/kernel/setup.sh
+  SUSFS_MIN_VERSION: 2.3.00
+  SUSFS_PATCH_OVERRIDE: ${{ inputs.susfs_patch_url }}
 
 jobs:
   build:
@@ -53,8 +61,13 @@ jobs:
 
       - name: SUSFS (floating)
         run: |
-          curl -fsSL "$SUSFS_PATCH_URL" -o /tmp/susfs.patch
-          grep -m1 'SUSFS_VERSION "' /tmp/susfs.patch || true
+          url="${SUSFS_PATCH_OVERRIDE:-$SUSFS_PATCH_URL}"
+          curl -fsSL "$url" -o /tmp/susfs.patch
+          ver=$(sed -n 's/^+#define SUSFS_VERSION "v\([0-9.]*\)".*/\1/p' /tmp/susfs.patch | head -1)
+          echo "SUSFS $ver from $url"
+          [ -n "$ver" ] || { echo "::error::SUSFS_VERSION not found in patch"; exit 1; }
+          [ "$(printf '%s\n%s\n' "$SUSFS_MIN_VERSION" "$ver" | sort -V | head -1)" = "$SUSFS_MIN_VERSION" ] \
+            || { echo "::error::SUSFS $ver is older than $SUSFS_MIN_VERSION required by BakaSU"; exit 1; }
           git apply --reject /tmp/susfs.patch || true
           # upstream 4.19 patch predates this tree's fs_context mount API and mm backports
           git apply susfs-4.19-compat.patch
@@ -69,6 +82,12 @@ jobs:
         run: |
           curl -fsSL "$HOOKS_URL" -o /tmp/hooks.sh
           bash /tmp/hooks.sh
+
+      - name: NoMount (floating dev)
+        run: |
+          curl -fsSL "$NOMOUNT_SETUP_URL" | bash -s
+          cfg="arch/$ARCH/configs/$DEFCONFIG"
+          grep -q '^CONFIG_NOMOUNT=' "$cfg" || echo "CONFIG_NOMOUNT=y" >> "$cfg"
 
       - name: Defconfig
         run: |
@@ -106,7 +125,10 @@ jobs:
               gzip -c "$boot/Image" > /tmp/Image.gz
               gz=/tmp/Image.gz
             fi
-            cat "$gz" $boot/dts/vendor/$CHIP/*.dtb > /tmp/Image.gz-dtb
+            dtb="$boot/dts/vendor/qcom/$CHIP.dtb"
+            [ -f "$dtb" ] || dtb=$(find "$boot/dts" -name "$CHIP.dtb" | head -1)
+            [ -f "$dtb" ] || { echo "::error::no $CHIP.dtb in build output"; exit 1; }
+            cat "$gz" "$dtb" > /tmp/Image.gz-dtb
             img=/tmp/Image.gz-dtb
           fi
           ls -l "$img"
