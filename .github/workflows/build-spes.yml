@@ -14,12 +14,18 @@ on:
         default: ''
   push:
     branches: [bka]
-    paths: ['.github/workflows/build-spes.yml']
+    paths:
+      - '.github/workflows/build-spes.yml'
+      - 'susfs-4.19-compat.patch'
   schedule:
     - cron: '0 2 * * 1'
 
 permissions:
   contents: write
+
+concurrency:
+  group: kernel-spes-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   ARCH: arm64
@@ -34,10 +40,12 @@ env:
   NOMOUNT_SETUP_URL: https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/dev/kernel/setup.sh
   SUSFS_MIN_VERSION: 2.3.00
   SUSFS_PATCH_OVERRIDE: ${{ inputs.susfs_patch_url }}
+  ZIP_NAME: spes-BakaSU-SUSFS.zip
 
 jobs:
   build:
     runs-on: ubuntu-22.04
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
         with:
@@ -63,11 +71,13 @@ jobs:
 
       - name: KernelSU (floating)
         run: |
+          set -o pipefail
           curl -sSL "$KSU_SETUP_URL" | bash -s "$KSU_BRANCH"
           echo "KSU_VER=$(git -C KernelSU rev-parse --short HEAD)" >> "$GITHUB_ENV"
 
       - name: SUSFS (floating)
         run: |
+          set -o pipefail
           url="${SUSFS_PATCH_OVERRIDE:-$SUSFS_PATCH_URL}"
           curl -fsSL "$url" -o /tmp/susfs.patch
           ver=$(sed -n 's/^+#define SUSFS_VERSION "v\([0-9.]*\)".*/\1/p' /tmp/susfs.patch | head -1)
@@ -76,26 +86,41 @@ jobs:
           [ "$(printf '%s\n%s\n' "$SUSFS_MIN_VERSION" "$ver" | sort -V | head -1)" = "$SUSFS_MIN_VERSION" ] \
             || { echo "::error::SUSFS $ver is older than $SUSFS_MIN_VERSION required by BakaSU"; exit 1; }
           echo "SUSFS_VER=$ver" >> "$GITHUB_ENV"
-          # the 4.19 patch predates this tree's fs_context mount API and mm backports,
-          # so a few hunks reject by design and are re-applied by susfs-4.19-compat.patch
+          # this tree has the fs_context mount API and newer mm helpers than the
+          # upstream 4.19 patch expects, so these five files reject by design and
+          # are restored by susfs-4.19-compat.patch
           git apply --reject /tmp/susfs.patch > /tmp/susfs-apply.log 2>&1 || true
           echo "upstream hunks rejected (expected): $(grep -c 'patch failed' /tmp/susfs-apply.log || true)"
           git apply susfs-4.19-compat.patch
           for f in fs/Makefile fs/super.c mm/memory.c fs/proc/task_mmu.c fs/namespace.c; do rm -f "$f.rej"; done
-          if find . -name '*.rej' | grep -q .; then
+          unexpected=$(find . -name '*.rej')
+          if [ -n "$unexpected" ]; then
             find . -name '*.rej' -exec sh -c 'echo "=== $1"; cat "$1"' _ {} \;
-            echo "::error::SUSFS patch left rejects, fix them and rerun"
+            echo "::error::SUSFS patch left unexpected rejects, fix them and rerun"
             exit 1
           fi
+          # the compat patch must keep every rejected hunk's functionality
+          check() { grep -q "$2" "$1" || { echo "::error::$1 lost '$2' (upstream SUSFS patch drifted)"; exit 1; }; }
+          check fs/Makefile 'obj-$(CONFIG_KSU_SUSFS) += susfs.o'
+          check fs/super.c 'DEFAULT_KSU_MNT_MINOR_DEV'
+          check mm/memory.c 'SUSFS_IS_INODE_SUS_MAP'
+          check fs/proc/task_mmu.c 'SUSFS_IS_INODE_SUS_MAP'
+          check fs/namespace.c 'susfs_alloc_non_unshare_ksu_vfsmnt'
           echo "SUSFS applied cleanly"
 
       - name: KSU inline hooks (floating)
         run: |
+          set -o pipefail
           curl -fsSL "$HOOKS_URL" -o /tmp/hooks.sh
-          bash /tmp/hooks.sh
+          bash /tmp/hooks.sh 2>&1 | tee /tmp/hooks.log
+          if grep -q 'patch failed for unknown reasons' /tmp/hooks.log; then
+            echo "::error::inline hook script failed to patch a file"
+            exit 1
+          fi
 
       - name: NoMount (floating dev)
         run: |
+          set -o pipefail
           curl -fsSL "$NOMOUNT_SETUP_URL" | bash -s
           echo "NOMOUNT_VER=$(git -C NoMount rev-parse --short HEAD)" >> "$GITHUB_ENV"
           cfg="arch/$ARCH/configs/$DEFCONFIG"
@@ -117,6 +142,9 @@ jobs:
           set -o pipefail
           M="O=out ARCH=$ARCH CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
           make $M "$DEFCONFIG"
+          for c in KSU KSU_SUSFS NOMOUNT; do
+            grep -q "^CONFIG_$c=y" out/.config || { echo "::error::CONFIG_$c did not survive Kconfig"; exit 1; }
+          done
           make $M -j"$(nproc)" 2>&1 | tee build.log
 
       - name: Upload build log
@@ -125,6 +153,7 @@ jobs:
         with:
           name: build-log
           path: build.log
+          if-no-files-found: ignore
 
       - name: Pack AnyKernel3
         run: |
@@ -137,46 +166,62 @@ jobs:
               gzip -c "$boot/Image" > /tmp/Image.gz
               gz=/tmp/Image.gz
             fi
-            dtb="$boot/dts/vendor/qcom/$CHIP.dtb"
-            [ -f "$dtb" ] || dtb=$(find "$boot/dts" -name "$CHIP.dtb" | head -1)
-            [ -f "$dtb" ] || { echo "::error::no $CHIP.dtb in build output"; exit 1; }
-            cat "$gz" "$dtb" > /tmp/Image.gz-dtb
+            if [ -f "$boot/dtb.img" ]; then
+              cat "$gz" "$boot/dtb.img" > /tmp/Image.gz-dtb
+            else
+              dtb=$(find "$boot/dts" -name "$CHIP.dtb" | head -1)
+              [ -n "$dtb" ] || { echo "::error::no dtb in build output"; exit 1; }
+              cat "$gz" "$dtb" > /tmp/Image.gz-dtb
+            fi
             img=/tmp/Image.gz-dtb
           fi
-          ls -l "$img"
           cp "$img" ak3/
+          if [ -f "$boot/dtbo.img" ]; then
+            cp "$boot/dtbo.img" ak3/
+          else
+            echo "::warning::dtbo.img missing, leaving the device dtbo untouched"
+          fi
+          ls -l ak3/Image.gz-dtb ak3/dtbo.img 2>/dev/null || true
           cat > ak3/anykernel.sh <<'AK3'
+          properties() { '
           kernel.string=BakaSU + SUSFS 4.19
-          do.devicecheck=0
+          do.devicecheck=1
           do.modules=0
           do.systemless=1
           do.cleanup=1
           do.cleanuponabort=0
           device.name1=spes
           device.name2=spesn
-          block=/dev/block/bootdevice/by-name/boot;
-          is_slot_device=0;
-          ramdisk_compression=auto;
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; }
+
+          BLOCK=/dev/block/bootdevice/by-name/boot;
+          IS_SLOT_DEVICE=0;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
           . tools/ak3-core.sh;
           dump_boot;
           write_boot;
           AK3
           cd ak3
-          zip -qr9 "../$DEVICE-KSU-SUSFS.zip" . -x '.git/*'
+          zip -qr9 "../$ZIP_NAME" . -x '.git*' 'README.md' '*placeholder'
           cd ..
-          ls -lh "$DEVICE-KSU-SUSFS.zip"
+          ls -lh "$ZIP_NAME"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.DEVICE }}-KSU-SUSFS
-          path: ${{ env.DEVICE }}-KSU-SUSFS.zip
+          name: ${{ env.DEVICE }}-BakaSU-SUSFS
+          path: ${{ env.ZIP_NAME }}
 
       - name: Summary
         if: always()
         run: |
           kver=$(sed -n 's/^#define UTS_RELEASE "\(.*\)"/\1/p' out/include/generated/utsrelease.h 2>/dev/null || true)
-          size=$(du -h "$DEVICE-KSU-SUSFS.zip" 2>/dev/null | cut -f1 || true)
+          size=$(du -h "$ZIP_NAME" 2>/dev/null | cut -f1 || true)
           {
             echo "### $DEVICE build"
             echo ""
@@ -184,7 +229,7 @@ jobs:
             echo "- KernelSU: BakaSU $KSU_BRANCH ${KSU_VER:-unknown}"
             echo "- SUSFS: v${SUSFS_VER:-unknown} (min $SUSFS_MIN_VERSION)"
             echo "- NoMount: dev ${NOMOUNT_VER:-unknown}"
-            echo "- artifact: $DEVICE-KSU-SUSFS.zip ${size:-not built}"
+            echo "- artifact: $ZIP_NAME ${size:-not built}"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Release
@@ -193,5 +238,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="spes-$(date -u +%Y%m%d-%H%M)-${GITHUB_SHA::7}"
-          gh release create "$TAG" "$DEVICE-KSU-SUSFS.zip" --repo "$GITHUB_REPOSITORY" \
+          gh release create "$TAG" "$ZIP_NAME" --repo "$GITHUB_REPOSITORY" \
             --title "$TAG" --notes "BakaSU $KSU_BRANCH + SUSFS 4.19 floating @ kernel ${GITHUB_SHA::7}"
