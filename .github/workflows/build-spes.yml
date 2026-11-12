@@ -1,0 +1,120 @@
+name: Build spes (SukiSU + SUSFS)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [bka]
+    paths: ['.github/workflows/build-spes.yml']
+  schedule:
+    - cron: '0 2 * * 1'
+
+permissions:
+  contents: write
+
+env:
+  ARCH: arm64
+  DEVICE: spes
+  DEFCONFIG: vendor/spes-perf_defconfig
+  KSU_SETUP_URL: https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/refs/heads/main/kernel/setup.sh
+  KSU_BRANCH: builtin
+  SUSFS_PATCH_URL: https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/mainline/Patches/Patch/susfs_patch_to_4.19.patch
+  CLANG_URL: https://github.com/kdrag0n/proton-clang.git
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          df -h /
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git curl bc bison flex libssl-dev libelf-dev device-tree-compiler \
+            zip unzip cpio python3 lz4 zstd ccache \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+
+      - name: Clang
+        run: |
+          git clone --depth=1 "$CLANG_URL" "$HOME/clang"
+          echo "$HOME/clang/bin" >> "$GITHUB_PATH"
+
+      - name: KernelSU (floating)
+        run: curl -sSL "$KSU_SETUP_URL" | bash -s "$KSU_BRANCH"
+
+      - name: SUSFS (floating)
+        run: |
+          curl -fsSL "$SUSFS_PATCH_URL" -o /tmp/susfs.patch
+          grep -m1 'SUSFS_VERSION "' /tmp/susfs.patch || true
+          patch -p1 --forward < /tmp/susfs.patch || true
+          if find . -name '*.rej' | grep -q .; then
+            find . -name '*.rej' -exec sh -c 'echo "=== $1"; cat "$1"' _ {} \;
+            echo "::error::SUSFS patch left rejects, fix them and rerun"
+            exit 1
+          fi
+
+      - name: Defconfig
+        run: |
+          cfg="arch/$ARCH/configs/$DEFCONFIG"
+          for c in KSU KSU_SUSFS KSU_SUSFS_SUS_PATH KSU_SUSFS_SUS_MOUNT KSU_SUSFS_SUS_KSTAT \
+                   KSU_SUSFS_SPOOF_UNAME KSU_SUSFS_ENABLE_LOG KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+                   KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG KSU_SUSFS_OPEN_REDIRECT KSU_SUSFS_SUS_MAP \
+                   KSU_SUSFS_PRIORITY_UID_FILTER THREAD_INFO_IN_TASK; do
+            grep -q "^CONFIG_$c=" "$cfg" || echo "CONFIG_$c=y" >> "$cfg"
+          done
+          tail -n 20 "$cfg"
+
+      - name: Build
+        run: |
+          M="O=out ARCH=$ARCH CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
+          make $M "$DEFCONFIG"
+          make $M -j"$(nproc)" 2>&1 | tee build.log
+
+      - name: Upload build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+
+      - name: Pack AnyKernel3
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3
+          img="out/arch/$ARCH/boot/Image.gz-dtb"
+          [ -f "$img" ] || img="out/arch/$ARCH/boot/Image.gz"
+          cp "$img" ak3/
+          cat > ak3/anykernel.sh <<'AK3'
+          kernel.string=SukiSU-Ultra + SUSFS 4.19
+          do.devicecheck=0
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=spes
+          device.name2=spesn
+          block=/dev/block/bootdevice/by-name/boot;
+          is_slot_device=0;
+          ramdisk_compression=auto;
+          . tools/ak3-core.sh;
+          dump_boot;
+          write_boot;
+          AK3
+          cd ak3
+          zip -qr9 "../$DEVICE-KSU-SUSFS.zip" . -x '.git/*'
+          cd ..
+          ls -lh "$DEVICE-KSU-SUSFS.zip"
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="spes-$(date -u +%Y%m%d-%H%M)-${GITHUB_SHA::7}"
+          gh release create "$TAG" "$DEVICE-KSU-SUSFS.zip" --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" --notes "SukiSU-Ultra $KSU_BRANCH + SUSFS 4.19 floating @ kernel ${GITHUB_SHA::7}"
