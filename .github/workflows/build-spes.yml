@@ -76,9 +76,10 @@ jobs:
           [ "$(printf '%s\n%s\n' "$SUSFS_MIN_VERSION" "$ver" | sort -V | head -1)" = "$SUSFS_MIN_VERSION" ] \
             || { echo "::error::SUSFS $ver is older than $SUSFS_MIN_VERSION required by BakaSU"; exit 1; }
           echo "SUSFS_VER=$ver" >> "$GITHUB_ENV"
-          echo "rejects below are expected: susfs-4.19-compat.patch fixes them"
-          git apply --reject /tmp/susfs.patch || true
-          # upstream 4.19 patch predates this tree's fs_context mount API and mm backports
+          # the 4.19 patch predates this tree's fs_context mount API and mm backports,
+          # so a few hunks reject by design and are re-applied by susfs-4.19-compat.patch
+          git apply --reject /tmp/susfs.patch > /tmp/susfs-apply.log 2>&1 || true
+          echo "upstream hunks rejected (expected): $(grep -c 'patch failed' /tmp/susfs-apply.log || true)"
           git apply susfs-4.19-compat.patch
           for f in fs/Makefile fs/super.c mm/memory.c fs/proc/task_mmu.c fs/namespace.c; do rm -f "$f.rej"; done
           if find . -name '*.rej' | grep -q .; then
@@ -86,6 +87,7 @@ jobs:
             echo "::error::SUSFS patch left rejects, fix them and rerun"
             exit 1
           fi
+          echo "SUSFS applied cleanly"
 
       - name: KSU inline hooks (floating)
         run: |
