@@ -19,6 +19,8 @@ env:
   KSU_BRANCH: main
   SUSFS_PATCH_URL: https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/mainline/Patches/Patch/susfs_patch_to_4.19.patch
   CLANG_URL: https://github.com/kdrag0n/proton-clang.git
+  HOOKS_URL: https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/mainline/Patches/susfs_inline_hook_patches.sh
+  CHIP: khaje
 
 jobs:
   build:
@@ -63,6 +65,11 @@ jobs:
             exit 1
           fi
 
+      - name: KSU inline hooks (floating)
+        run: |
+          curl -fsSL "$HOOKS_URL" -o /tmp/hooks.sh
+          bash /tmp/hooks.sh
+
       - name: Defconfig
         run: |
           cfg="arch/$ARCH/configs/$DEFCONFIG"
@@ -76,6 +83,7 @@ jobs:
 
       - name: Build
         run: |
+          set -o pipefail
           M="O=out ARCH=$ARCH CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
           make $M "$DEFCONFIG"
           make $M -j"$(nproc)" 2>&1 | tee build.log
@@ -90,8 +98,15 @@ jobs:
       - name: Pack AnyKernel3
         run: |
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3
-          img="out/arch/$ARCH/boot/Image.gz-dtb"
-          [ -f "$img" ] || img="out/arch/$ARCH/boot/Image.gz"
+          boot="out/arch/$ARCH/boot"
+          img="$boot/Image.gz-dtb"
+          if [ ! -f "$img" ]; then
+            gz="$boot/Image.gz"
+            [ -f "$gz" ] || gzip -c "$boot/Image" > /tmp/Image.gz && gz=/tmp/Image.gz
+            cat "$gz" $boot/dts/vendor/$CHIP/*.dtb > /tmp/Image.gz-dtb
+            img=/tmp/Image.gz-dtb
+          fi
+          ls -l "$img"
           cp "$img" ak3/
           cat > ak3/anykernel.sh <<'AK3'
           kernel.string=BakaSU + SUSFS 4.19
