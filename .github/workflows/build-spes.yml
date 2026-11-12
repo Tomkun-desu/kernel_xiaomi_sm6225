@@ -102,7 +102,10 @@ jobs:
           img="$boot/Image.gz-dtb"
           if [ ! -f "$img" ]; then
             gz="$boot/Image.gz"
-            [ -f "$gz" ] || gzip -c "$boot/Image" > /tmp/Image.gz && gz=/tmp/Image.gz
+            if [ ! -f "$gz" ]; then
+              gzip -c "$boot/Image" > /tmp/Image.gz
+              gz=/tmp/Image.gz
+            fi
             cat "$gz" $boot/dts/vendor/$CHIP/*.dtb > /tmp/Image.gz-dtb
             img=/tmp/Image.gz-dtb
           fi
