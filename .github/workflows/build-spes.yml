@@ -53,9 +53,9 @@ jobs:
         run: |
           curl -fsSL "$SUSFS_PATCH_URL" -o /tmp/susfs.patch
           grep -m1 'SUSFS_VERSION "' /tmp/susfs.patch || true
-          patch -p1 --forward < /tmp/susfs.patch || true
+          git apply --reject /tmp/susfs.patch || true
           # upstream 4.19 patch predates this tree's fs_context mount API and mm backports
-          patch -p1 --forward < susfs-4.19-compat.patch
+          git apply susfs-4.19-compat.patch
           for f in fs/Makefile fs/super.c mm/memory.c fs/proc/task_mmu.c fs/namespace.c; do rm -f "$f.rej"; done
           if find . -name '*.rej' | grep -q .; then
             find . -name '*.rej' -exec sh -c 'echo "=== $1"; cat "$1"' _ {} \;
