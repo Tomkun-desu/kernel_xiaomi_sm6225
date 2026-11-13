@@ -8,8 +8,16 @@ on:
         type: boolean
         required: false
         default: false
-      susfs_patch_url:
-        description: 'SUSFS 4.19 patch URL override (empty = latest upstream mirror)'
+      bakasu_commit:
+        description: 'BakaSU commit/tag (empty = latest main)'
+        required: false
+        default: ''
+      jackaltman_commit:
+        description: 'JackA1ltman/NonGKI_Kernel_Build_2nd commit/tag for patch+hooks (empty = latest mainline)'
+        required: false
+        default: ''
+      nomount_commit:
+        description: 'NoMount commit/tag (empty = latest dev)'
         required: false
         default: ''
   push:
@@ -32,14 +40,11 @@ env:
   DEVICE: spes
   DEFCONFIG: vendor/spes-perf_defconfig
   KSU_SETUP_URL: https://raw.githubusercontent.com/Baka-SU/BakaSU/refs/heads/main/kernel/setup.sh
-  KSU_BRANCH: main
-  SUSFS_PATCH_URL: https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/mainline/Patches/Patch/susfs_patch_to_4.19.patch
+  JACK_RAW: https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd
   CLANG_URL: https://github.com/kdrag0n/proton-clang.git
-  HOOKS_URL: https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/mainline/Patches/susfs_inline_hook_patches.sh
   CHIP: khaje
   NOMOUNT_SETUP_URL: https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/dev/kernel/setup.sh
   SUSFS_MIN_VERSION: 2.3.00
-  SUSFS_PATCH_OVERRIDE: ${{ inputs.susfs_patch_url }}
   ZIP_NAME: spes-BakaSU-SUSFS.zip
   # every symbol here must exist in BakaSU's Kconfig, otherwise Kconfig drops
   # it silently and the feature is compiled out while the build stays green
@@ -72,16 +77,27 @@ jobs:
           git clone --depth=1 "$CLANG_URL" "$HOME/clang"
           echo "$HOME/clang/bin" >> "$GITHUB_PATH"
 
-      - name: KernelSU (floating)
+      - name: KernelSU (floating or pinned)
+        env:
+          BAKASU_COMMIT: ${{ inputs.bakasu_commit }}
         run: |
           set -o pipefail
-          curl -sSL "$KSU_SETUP_URL" | bash -s "$KSU_BRANCH"
+          curl -fsSL "$KSU_SETUP_URL" | bash -s "$BAKASU_COMMIT"
+          if [ -n "$BAKASU_COMMIT" ]; then
+            git -C KernelSU fetch -q origin "$BAKASU_COMMIT" 2>/dev/null || true
+            git -C KernelSU checkout -q --detach "$BAKASU_COMMIT"
+            [ "$(git -C KernelSU rev-parse HEAD)" = "$(git -C KernelSU rev-parse "$BAKASU_COMMIT^{commit}")" ] \
+              || { echo "::error::BakaSU is not at $BAKASU_COMMIT"; exit 1; }
+          fi
           echo "KSU_VER=$(git -C KernelSU rev-parse --short HEAD)" >> "$GITHUB_ENV"
 
-      - name: SUSFS (floating)
+      - name: SUSFS (floating or pinned)
+        env:
+          JACK_COMMIT: ${{ inputs.jackaltman_commit }}
         run: |
           set -o pipefail
-          url="${SUSFS_PATCH_OVERRIDE:-$SUSFS_PATCH_URL}"
+          ref="${JACK_COMMIT:-mainline}"
+          url="$JACK_RAW/$ref/Patches/Patch/susfs_patch_to_4.19.patch"
           curl -fsSL "$url" -o /tmp/susfs.patch
           ver=$(sed -n 's/^+#define SUSFS_VERSION "v\([0-9.]*\)".*/\1/p' /tmp/susfs.patch | head -1)
           echo "SUSFS $ver from $url"
@@ -111,10 +127,13 @@ jobs:
           check fs/namespace.c 'susfs_alloc_non_unshare_ksu_vfsmnt'
           echo "SUSFS applied cleanly"
 
-      - name: KSU inline hooks (floating)
+      - name: KSU inline hooks (floating or pinned)
+        env:
+          JACK_COMMIT: ${{ inputs.jackaltman_commit }}
         run: |
           set -o pipefail
-          curl -fsSL "$HOOKS_URL" -o /tmp/hooks.sh
+          ref="${JACK_COMMIT:-mainline}"
+          curl -fsSL "$JACK_RAW/$ref/Patches/susfs_inline_hook_patches.sh" -o /tmp/hooks.sh
           bash /tmp/hooks.sh 2>&1 | tee /tmp/hooks.log
           if grep -q 'patch failed for unknown reasons' /tmp/hooks.log; then
             echo "::error::inline hook script failed to patch a file"
@@ -126,10 +145,16 @@ jobs:
           [ "$(printf '%s\n%s\n' "$hook_ver" "$SUSFS_VER" | sort -V | head -1)" = "$hook_ver" ] \
             || { echo "::error::hooks.sh expects SUSFS >= $hook_ver but $SUSFS_VER is applied"; exit 1; }
 
-      - name: NoMount (floating dev)
+      - name: NoMount (floating or pinned)
+        env:
+          NOMOUNT_COMMIT: ${{ inputs.nomount_commit }}
         run: |
           set -o pipefail
-          curl -fsSL "$NOMOUNT_SETUP_URL" | bash -s
+          curl -fsSL "$NOMOUNT_SETUP_URL" | bash -s "$NOMOUNT_COMMIT"
+          if [ -n "$NOMOUNT_COMMIT" ]; then
+            [ "$(git -C NoMount rev-parse HEAD)" = "$(git -C NoMount rev-parse "$NOMOUNT_COMMIT^{commit}")" ] \
+              || { echo "::error::NoMount is not at $NOMOUNT_COMMIT"; exit 1; }
+          fi
           echo "NOMOUNT_VER=$(git -C NoMount rev-parse --short HEAD)" >> "$GITHUB_ENV"
           cfg="arch/$ARCH/configs/$DEFCONFIG"
           grep -q '^CONFIG_NOMOUNT=' "$cfg" || echo "CONFIG_NOMOUNT=y" >> "$cfg"
