@@ -5,6 +5,8 @@ file_wrapper.c: iopoll/remap_file_range/REMAP_FILE_DEDUP arrived after 4.19;
 the wrapper only forwards them, so compiling them out costs nothing.
 seccomp_cache.c: 4.19 has no per-arch seccomp cache (struct action_cache);
 the allow/clear hooks are unused, so stub them.
+su_mount_ns.c: there is no uapi/linux/mount.h before 5.10; linux/mount.h has
+the MS_* flags which is all this file uses.
 """
 import os
 import re
@@ -61,5 +63,17 @@ def seccomp_cache():
     print("seccomp_cache: patched")
 
 
+def su_mount_ns():
+    p = os.path.join(root, "kernel/infra/su_mount_ns.c")
+    s = open(p).read()
+    if "<uapi/linux/mount.h>" not in s:
+        print("su_mount_ns: already patched")
+        return
+    s = s.replace("#include <uapi/linux/mount.h>\n", "#include <linux/mount.h>\n", 1)
+    open(p, "w").write(s)
+    print("su_mount_ns: patched")
+
+
 file_wrapper()
 seccomp_cache()
+su_mount_ns()
