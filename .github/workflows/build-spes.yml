@@ -256,9 +256,9 @@ jobs:
             echo "### $DEVICE build"
             echo ""
             echo "- kernel: ${kver:-unknown} @ ${GITHUB_SHA::7}"
-            echo "- KernelSU: BakaSU $KSU_BRANCH ${KSU_VER:-unknown}"
-            echo "- SUSFS: v${SUSFS_VER:-unknown} (min $SUSFS_MIN_VERSION)"
-            echo "- NoMount: dev ${NOMOUNT_VER:-unknown}"
+            echo "- KernelSU: BakaSU ${KSU_VER:-unknown} (ref: ${{ inputs.bakasu_commit || 'main' }})"
+            echo "- SUSFS: v${SUSFS_VER:-unknown} (min $SUSFS_MIN_VERSION, ref: ${{ inputs.jackaltman_commit || 'mainline' }})"
+            echo "- NoMount: ${NOMOUNT_VER:-unknown} (ref: ${{ inputs.nomount_commit || 'dev' }})"
             echo "- artifact: $ZIP_NAME ${size:-not built}"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -269,4 +269,4 @@ jobs:
         run: |
           TAG="spes-$(date -u +%Y%m%d-%H%M)-${GITHUB_SHA::7}"
           gh release create "$TAG" "$ZIP_NAME" --repo "$GITHUB_REPOSITORY" \
-            --title "$TAG" --notes "BakaSU $KSU_BRANCH + SUSFS 4.19 floating @ kernel ${GITHUB_SHA::7}"
+            --title "$TAG" --notes "BakaSU ${KSU_VER:-unknown} + SUSFS v${SUSFS_VER:-unknown} @ kernel ${GITHUB_SHA::7}"
