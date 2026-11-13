@@ -1,0 +1,33 @@
+--- a/kernel/Kconfig
++++ b/kernel/Kconfig
+@@ -244,6 +244,14 @@
+         - It may not be able to evade detections by apps that implement a good injection detection.
+         - Effective only on zygote spawned umounted user app process >= 10000.
+ 
++config KSU_SUSFS_PRIORITY_UID_FILTER
++    bool "Enable hiding user-defined app uids from getpriority/setpriority/ioprio syscalls"
++    depends on KSU_SUSFS
++    default y
++    help
++        - Allow hiding selected app uids from getpriority/setpriority/ioprio_get/ioprio_set.
++        - Required by BRENE's hide_third_party_apps (CMD_SUSFS_SET_PRIORITY_UID_FILTER 0x60030).
++
+ endmenu
+ 
+ endmenu
+--- a/kernel/supercall/dispatch.c
++++ b/kernel/supercall/dispatch.c
+@@ -1168,6 +1168,13 @@
+         return 0;
+     }
+ #endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP
++#ifdef CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER
++    case CMD_SUSFS_SET_PRIORITY_UID_FILTER: {
++        extern void susfs_set_priority_uid_filter(void __user **user_info);
++        susfs_set_priority_uid_filter(arg);
++        return 0;
++    }
++#endif // #ifdef CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER
+     case CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING: {
+         susfs_set_avc_log_spoofing(arg);
+         return 0;

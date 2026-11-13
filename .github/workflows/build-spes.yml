@@ -1,4 +1,4 @@
-name: Build spes (KernelSU-Next + SUSFS)
+name: Build spes (BakaSU + SUSFS)
 
 on:
   workflow_dispatch:
@@ -8,8 +8,8 @@ on:
         type: boolean
         required: false
         default: false
-      ksu_ref:
-        description: 'KernelSU-Next branch/tag/commit (empty = dev-susfs)'
+      bakasu_commit:
+        description: 'BakaSU commit/tag (empty = latest main)'
         required: false
         default: ''
       jackaltman_commit:
@@ -39,14 +39,14 @@ env:
   ARCH: arm64
   DEVICE: spes
   DEFCONFIG: vendor/spes-perf_defconfig
-  KSU_SETUP_URL: https://raw.githubusercontent.com/pershoot/KernelSU-Next/refs/heads/dev-susfs/kernel/setup.sh
+  KSU_SETUP_URL: https://raw.githubusercontent.com/Baka-SU/BakaSU/refs/heads/main/kernel/setup.sh
   JACK_RAW: https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd
   CLANG_URL: https://github.com/kdrag0n/proton-clang.git
   CHIP: khaje
   NOMOUNT_SETUP_URL: https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/dev/kernel/setup.sh
   SUSFS_MIN_VERSION: 2.3.00
-  ZIP_NAME: spes-KernelSU-Next-SUSFS.zip
-  # every symbol here must exist in the KSU fork's Kconfig, otherwise Kconfig drops
+  ZIP_NAME: spes-BakaSU-SUSFS.zip
+  # every symbol here must exist in BakaSU's Kconfig, otherwise Kconfig drops
   # it silently and the feature is compiled out while the build stays green
   SUSFS_CONFIGS: KSU KSU_SUSFS KSU_SUSFS_SUS_PATH KSU_SUSFS_SUS_MOUNT KSU_SUSFS_SUS_KSTAT KSU_SUSFS_SPOOF_UNAME KSU_SUSFS_ENABLE_LOG KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG KSU_SUSFS_OPEN_REDIRECT KSU_SUSFS_SUS_MAP KSU_SUSFS_PRIORITY_UID_FILTER THREAD_INFO_IN_TASK
 
@@ -77,15 +77,26 @@ jobs:
           git clone --depth=1 "$CLANG_URL" "$HOME/clang"
           echo "$HOME/clang/bin" >> "$GITHUB_PATH"
 
-      - name: KernelSU-Next (floating or pinned)
+      - name: KernelSU (floating or pinned)
         env:
-          KSU_REF: ${{ inputs.ksu_ref }}
+          BAKASU_COMMIT: ${{ inputs.bakasu_commit }}
         run: |
           set -o pipefail
-          ref="${KSU_REF:-dev-susfs}"
-          curl -fsSL "$KSU_SETUP_URL" | bash -s "$ref"
-          [ "$(git -C KernelSU-Next rev-parse --abbrev-ref HEAD)" != "HEAD" ] || git -C KernelSU-Next checkout -q "$ref"
-          echo "KSU_VER=$(git -C KernelSU-Next rev-parse --short HEAD) ($ref)" >> "$GITHUB_ENV"
+          curl -fsSL "$KSU_SETUP_URL" | bash -s "$BAKASU_COMMIT"
+          if [ -n "$BAKASU_COMMIT" ]; then
+            git -C KernelSU fetch -q origin "$BAKASU_COMMIT" 2>/dev/null || true
+            git -C KernelSU checkout -q --detach "$BAKASU_COMMIT"
+            [ "$(git -C KernelSU rev-parse HEAD)" = "$(git -C KernelSU rev-parse "$BAKASU_COMMIT^{commit}")" ] \
+              || { echo "::error::BakaSU is not at $BAKASU_COMMIT"; exit 1; }
+          fi
+          echo "KSU_VER=$(git -C KernelSU rev-parse --short HEAD)" >> "$GITHUB_ENV"
+
+      - name: KSU patch (priority uid filter)
+        run: |
+          git -C KernelSU apply --verbose ../ksu-priority-uid-filter.patch
+          grep -q KSU_SUSFS_PRIORITY_UID_FILTER KernelSU/kernel/Kconfig
+          grep -q CMD_SUSFS_SET_PRIORITY_UID_FILTER KernelSU/kernel/supercall/dispatch.c
+          echo "0x60030 dispatch added to BakaSU"
 
       - name: SUSFS (floating or pinned)
         env:
@@ -99,7 +110,7 @@ jobs:
           echo "SUSFS $ver from $url"
           [ -n "$ver" ] || { echo "::error::SUSFS_VERSION not found in patch"; exit 1; }
           [ "$(printf '%s\n%s\n' "$SUSFS_MIN_VERSION" "$ver" | sort -V | head -1)" = "$SUSFS_MIN_VERSION" ] \
-            || { echo "::error::SUSFS $ver is older than $SUSFS_MIN_VERSION required by KernelSU-Next"; exit 1; }
+            || { echo "::error::SUSFS $ver is older than $SUSFS_MIN_VERSION required by BakaSU"; exit 1; }
           echo "SUSFS_VER=$ver" >> "$GITHUB_ENV"
           # this tree has the fs_context mount API and newer mm helpers than the
           # upstream 4.19 patch expects, so these five files reject by design and
@@ -210,7 +221,7 @@ jobs:
           ls -l ak3/Image.gz-dtb ak3/dtbo.img 2>/dev/null || true
           cat > ak3/anykernel.sh <<'AK3'
           properties() { '
-          kernel.string=KernelSU-Next + SUSFS 4.19
+          kernel.string=BakaSU + SUSFS 4.19
           do.devicecheck=1
           do.modules=0
           do.systemless=1
@@ -240,7 +251,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.DEVICE }}-KernelSU-Next-SUSFS
+          name: ${{ env.DEVICE }}-BakaSU-SUSFS
           path: ${{ env.ZIP_NAME }}
 
       - name: Summary
@@ -252,7 +263,7 @@ jobs:
             echo "### $DEVICE build"
             echo ""
             echo "- kernel: ${kver:-unknown} @ ${GITHUB_SHA::7}"
-            echo "- KernelSU: KernelSU-Next ${KSU_VER:-unknown}"
+            echo "- KernelSU: BakaSU ${KSU_VER:-unknown} (ref: ${{ inputs.bakasu_commit || 'main' }})"
             echo "- SUSFS: v${SUSFS_VER:-unknown} (min $SUSFS_MIN_VERSION, ref: ${{ inputs.jackaltman_commit || 'mainline' }})"
             echo "- NoMount: ${NOMOUNT_VER:-unknown} (ref: ${{ inputs.nomount_commit || 'dev' }})"
             echo "- artifact: $ZIP_NAME ${size:-not built}"
@@ -265,4 +276,4 @@ jobs:
         run: |
           TAG="spes-$(date -u +%Y%m%d-%H%M)-${GITHUB_SHA::7}"
           gh release create "$TAG" "$ZIP_NAME" --repo "$GITHUB_REPOSITORY" \
-            --title "$TAG" --notes "KernelSU-Next ${KSU_VER:-unknown} + SUSFS v${SUSFS_VER:-unknown} @ kernel ${GITHUB_SHA::7}"
+            --title "$TAG" --notes "BakaSU ${KSU_VER:-unknown} + SUSFS v${SUSFS_VER:-unknown} @ kernel ${GITHUB_SHA::7}"
