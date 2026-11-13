@@ -142,7 +142,7 @@ jobs:
           git apply --verbose susfs-priority-uid-filter-defer.patch
           [ "$(grep -c 'schedule_work(&susfs_priority_app_strings_work)' fs/susfs.c)" = "1" ] \
             || { echo "::error::priority uid filter workqueue hook missing"; exit 1; }
-          [ "$(grep -c 'susfs_switch_to_ksu_domain()' fs/susfs.c)" = "1" ] \
+          [ "$(grep -c 'orig_cred = susfs_switch_to_ksu_domain();' fs/susfs.c)" = "1" ] \
             || { echo "::error::creds switch still runs inline in the syscall hook"; exit 1; }
           [ "$(grep -c 'strncpy_from_user(app_buf' fs/susfs.c)" = "1" ] \
             || { echo "::error::priority uid filter string copy missing"; exit 1; }
