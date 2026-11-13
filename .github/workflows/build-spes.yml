@@ -206,22 +206,14 @@ jobs:
               gzip -c "$boot/Image" > /tmp/Image.gz
               gz=/tmp/Image.gz
             fi
-            if [ -f "$boot/dtb.img" ]; then
-              cat "$gz" "$boot/dtb.img" > /tmp/Image.gz-dtb
-            else
-              dtb=$(find "$boot/dts" -name "$CHIP.dtb" | head -1)
-              [ -n "$dtb" ] || { echo "::error::no dtb in build output"; exit 1; }
-              cat "$gz" "$dtb" > /tmp/Image.gz-dtb
-            fi
+            dtb=$(find "$boot/dts" -name "$CHIP.dtb" | head -1)
+            [ -n "$dtb" ] || { echo "::error::no $CHIP.dtb in build output"; exit 1; }
+            cat "$gz" "$dtb" > /tmp/Image.gz-dtb
             img=/tmp/Image.gz-dtb
           fi
           cp "$img" ak3/
-          if [ -f "$boot/dtbo.img" ]; then
-            cp "$boot/dtbo.img" ak3/
-          else
-            echo "::warning::dtbo.img missing, leaving the device dtbo untouched"
-          fi
-          ls -l ak3/Image.gz-dtb ak3/dtbo.img 2>/dev/null || true
+          # kernel-only zip: never rewrite dtbo, the stock overlays already match this tree
+          ls -l ak3/Image.gz-dtb
           cat > ak3/anykernel.sh <<'AK3'
           properties() { '
           kernel.string=BakaSU + SUSFS 4.19
