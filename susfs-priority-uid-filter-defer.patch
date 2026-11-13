@@ -1,0 +1,160 @@
+--- a/fs/susfs.c	2026-11-13 17:15:49.629904298 +0000
++++ b/fs/susfs.c	2026-11-13 17:15:49.665904298 +0000
+@@ -1606,44 +1606,37 @@
+ }
+ 
+ void susfs_set_priority_uid_filter(void __user **user_info) {
+-	struct st_susfs_priority_uid_filter *info = NULL;
+-	struct susfs_priority_uid_filter_bitmap *new_bitmap = NULL;
+-	struct susfs_priority_uid_filter_bitmap *old_bitmap = NULL;
++	struct st_susfs_priority_uid_filter __user *uinfo = *user_info;
+ 	char *new_app_strings = NULL;
+-	struct cred *orig_cred = NULL;
++	static char app_buf[SUSFS_APP_STR_BUF_SIZE + 1];
+ 	size_t app_str_len = 0;
+ 	int err = 0;
+-	static bool is_uid_filter_set_before = false;
+ 
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 12, 0)
+-	info = susfs_kvmalloc(sizeof(*info), GFP_KERNEL | __GFP_ZERO);
+-#else
+-	info = kvmalloc(sizeof(*info), GFP_KERNEL | __GFP_ZERO);
+-#endif
+-	if (!info) {
+-		err = -ENOMEM;
+-		goto out_copy_to_user;
+-	}
+-
+-	if (copy_from_user(info, (struct st_susfs_priority_uid_filter __user*)*user_info, sizeof(*info))) {
++	/*
++	 * Only the user string is read here. Resolving the uids needs path
++	 * lookups, allocations and a selinux domain switch, all of which may
++	 * sleep while this runs from the syscall hook, so that work is deferred
++	 * to the workqueue in susfs_parse_priority_app_strings().
++	 */
++	if (strncpy_from_user(app_buf, uinfo->app_strings, SUSFS_APP_STR_BUF_SIZE) < 0) {
+ 		err = -EFAULT;
+ 		goto out_copy_to_user;
+ 	}
+ 
+ 	/* the app names string must be null terminated within the buffer */
+-	if (!memchr(info->app_strings, '\0', sizeof(info->app_strings))) {
++	if (!memchr(app_buf, '\0', SUSFS_APP_STR_BUF_SIZE)) {
+ 		SUSFS_LOGE("the app names string is not null terminated\n");
+ 		err = -EINVAL;
+ 		goto out_copy_to_user;
+ 	}
+ 
+-	if (*info->app_strings == '\0') {
++	if (*app_buf == '\0') {
+ 		SUSFS_LOGE("the app names string cannot be empty\n");
+ 		err = -EINVAL;
+ 		goto out_copy_to_user;
+ 	}
+ 
+-	app_str_len = strlen(info->app_strings);
++	app_str_len = strlen(app_buf);
+ 
+ 	/*
+ 	 * The app names are stored as they are, so that the uids of the apps can
+@@ -1658,71 +1651,27 @@
+ 		err = -ENOMEM;
+ 		goto out_copy_to_user;
+ 	}
+-	memcpy(new_app_strings, info->app_strings, app_str_len + 1);
++	memcpy(new_app_strings, app_buf, app_str_len + 1);
+ 
+-	new_bitmap = (struct susfs_priority_uid_filter_bitmap *)kzalloc(sizeof(*new_bitmap), GFP_KERNEL);
+-	if (!new_bitmap) {
+-		err = -ENOMEM;
++	if (!mutex_trylock(&susfs_mutex_lock_priority_uid_filter)) {
++		err = -EBUSY;
+ 		goto out_free_new_app_strings;
+ 	}
+-
+-	/*
+-	 * The data paths of the apps cannot be accessed with the selinux
+-	 * restrictions of the calling process, hence the selinux domain is
+-	 * switched to the KernelSU one before the uids are resolved.
+-	 */
+-	orig_cred = susfs_switch_to_ksu_domain();
+-	if (!orig_cred) {
+-		err = -EINVAL;
+-		goto out_free_new_bitmap;
+-	}
+-
+-	if (is_uid_filter_set_before)
+-		SUSFS_LOGI("renewing the priority uid filter\n");
+-	err = susfs_parse_priority_app_names(info->app_strings, new_bitmap->bits, true);
+-
+-	susfs_restore_creds(orig_cred);
+-	orig_cred = NULL;
+-
+-	if (err)
+-		goto out_free_new_bitmap;
+-
+-	/*
+-	 * Publish the new bitmap and drop the old one.
+-	 * The mutex serializes the writers, while the readers are protected
+-	 * by RCU, hence the readers always see a consistent bitmap and they
+-	 * never access a freed bitmap.
+-	 */
+-	mutex_lock(&susfs_mutex_lock_priority_uid_filter);
+-	old_bitmap = rcu_dereference_protected(priority_uid_filter_bitmap, lockdep_is_held(&susfs_mutex_lock_priority_uid_filter));
+-	rcu_assign_pointer(priority_uid_filter_bitmap, new_bitmap);
+-	new_bitmap = NULL;
+ 	kvfree(susfs_priority_app_strings);
+ 	susfs_priority_app_strings = new_app_strings;
+ 	new_app_strings = NULL;
+-	if (!is_uid_filter_set_before)
+-		is_uid_filter_set_before = true;
+ 	mutex_unlock(&susfs_mutex_lock_priority_uid_filter);
+-	synchronize_rcu();
+-	if (old_bitmap)
+-		kfree_rcu(old_bitmap, rcu);
+ 
+-	SUSFS_LOGI("the priority uid filter is set\n");
++	susfs_parse_priority_app_strings();
+ 	err = 0;
+ 
+-out_free_new_bitmap:
+-	if (new_bitmap)
+-		kfree(new_bitmap);
+ out_free_new_app_strings:
+ 	if (new_app_strings)
+ 		kvfree(new_app_strings);
+ out_copy_to_user:
+-	if (copy_to_user(&((struct st_susfs_priority_uid_filter __user*)*user_info)->err, &err, sizeof(err))) {
++	if (copy_to_user(&uinfo->err, &err, sizeof(err)))
+ 		err = -EFAULT;
+-	}
+ 	SUSFS_LOGI("CMD_SUSFS_SET_PRIORITY_UID_FILTER -> ret: %d\n", err);
+-	if (info)
+-		kvfree(info);
+ }
+ 
+ /*
+@@ -1806,14 +1755,20 @@
+  * because the resolving of the uids requires the KernelSU selinux domain,
+  * which must not be applied to the calling process.
+  */
++static void susfs_priority_app_strings_workfn(struct work_struct *work) {
++	susfs_priority_app_strings_worker(NULL);
++}
++
++static DECLARE_WORK(susfs_priority_app_strings_work, susfs_priority_app_strings_workfn);
++
+ void susfs_parse_priority_app_strings(void) {
+-	/* do not spawn a new thread if there is already one running */
++	/* do not queue a new run while one is already pending or running */
+ 	if (atomic_cmpxchg(&susfs_priority_app_strings_running, 0, 1))
+ 		return;
+ 
+-	if (IS_ERR(kthread_run(susfs_priority_app_strings_worker, NULL, "susfs_gpsp_appstr"))) {
++	if (!schedule_work(&susfs_priority_app_strings_work)) {
+ 		atomic_set(&susfs_priority_app_strings_running, 0);
+-		SUSFS_LOGE("failed to create the thread susfs_priority_app_strings\n");
++		SUSFS_LOGE("failed to queue the priority uid filter work\n");
+ 	}
+ }
+ 

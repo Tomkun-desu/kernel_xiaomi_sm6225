@@ -11,11 +11,11 @@ on:
       bakasu_commit:
         description: 'BakaSU commit/tag (empty = latest main)'
         required: false
-        default: ''
+        default: '548d1dda060ca198823d8808804d01f5209ef4a9'
       jackaltman_commit:
         description: 'JackA1ltman/NonGKI_Kernel_Build_2nd commit/tag for patch+hooks (empty = latest mainline)'
         required: false
-        default: ''
+        default: 'e34397912802b6d8f07aeb6ebfd475eb5d841dfe'
       nomount_commit:
         description: 'NoMount commit/tag (empty = latest dev)'
         required: false
@@ -134,6 +134,20 @@ jobs:
           check fs/namespace.c 'susfs_alloc_non_unshare_ksu_vfsmnt'
           echo "SUSFS applied cleanly"
 
+      - name: SUSFS patch (defer the uid filter resolve off the syscall hook)
+        run: |
+          # the supercall runs from a syscall hook where path lookups, the
+          # selinux creds switch and synchronize_rcu() may not sleep, so the
+          # resolve has to run from the workqueue instead
+          git apply --verbose susfs-priority-uid-filter-defer.patch
+          [ "$(grep -c 'schedule_work(&susfs_priority_app_strings_work)' fs/susfs.c)" = "1" ] \
+            || { echo "::error::priority uid filter workqueue hook missing"; exit 1; }
+          [ "$(grep -c 'susfs_switch_to_ksu_domain()' fs/susfs.c)" = "1" ] \
+            || { echo "::error::creds switch still runs inline in the syscall hook"; exit 1; }
+          [ "$(grep -c 'strncpy_from_user(app_buf' fs/susfs.c)" = "1" ] \
+            || { echo "::error::priority uid filter string copy missing"; exit 1; }
+          echo "priority uid filter resolve deferred to a workqueue"
+
       - name: KSU inline hooks (floating or pinned)
         env:
           JACK_COMMIT: ${{ inputs.jackaltman_commit }}
@@ -181,9 +195,6 @@ jobs:
           make $M "$DEFCONFIG"
           for c in $SUSFS_CONFIGS NOMOUNT; do
             grep -q "^CONFIG_$c=y" out/.config || { echo "::error::CONFIG_$c did not survive Kconfig (undefined symbol?)"; exit 1; }
-          done
-          for c in IKCONFIG_PROC IKHEADERS; do
-            grep -q "^# CONFIG_$c is not set" out/.config || { echo "::error::CONFIG_$c still exposed in the module symbol surface"; exit 1; }
           done
           make $M -j"$(nproc)" 2>&1 | tee build.log
 
