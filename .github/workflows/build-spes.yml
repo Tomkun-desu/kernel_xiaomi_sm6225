@@ -182,6 +182,9 @@ jobs:
           for c in $SUSFS_CONFIGS NOMOUNT; do
             grep -q "^CONFIG_$c=y" out/.config || { echo "::error::CONFIG_$c did not survive Kconfig (undefined symbol?)"; exit 1; }
           done
+          for c in IKCONFIG_PROC IKHEADERS; do
+            grep -q "^# CONFIG_$c is not set" out/.config || { echo "::error::CONFIG_$c still exposed in the module symbol surface"; exit 1; }
+          done
           make $M -j"$(nproc)" 2>&1 | tee build.log
 
       - name: Upload build log
