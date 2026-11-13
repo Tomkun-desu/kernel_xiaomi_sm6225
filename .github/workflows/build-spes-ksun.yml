@@ -1,0 +1,276 @@
+name: Build spes (KernelSU-Next + SUSFS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Create a GitHub release (otherwise only a workflow artifact)'
+        type: boolean
+        required: false
+        default: false
+      ksu_ref:
+        description: 'KernelSU-Next branch/tag/commit (empty = dev-susfs)'
+        required: false
+        default: ''
+      jackaltman_commit:
+        description: 'JackA1ltman/NonGKI_Kernel_Build_2nd commit/tag for patch+hooks (empty = latest mainline)'
+        required: false
+        default: ''
+      nomount_commit:
+        description: 'NoMount commit/tag (empty = latest dev)'
+        required: false
+        default: ''
+  push:
+    branches: [bka]
+    paths:
+      - '.github/workflows/build-spes-ksun.yml'
+  schedule:
+    - cron: '0 2 * * 1'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: kernel-spes-ksun-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ARCH: arm64
+  DEVICE: spes
+  DEFCONFIG: vendor/spes-perf_defconfig
+  KSU_SETUP_URL: https://raw.githubusercontent.com/pershoot/KernelSU-Next/refs/heads/dev-susfs/kernel/setup.sh
+  JACK_RAW: https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd
+  CLANG_URL: https://github.com/kdrag0n/proton-clang.git
+  CHIP: khaje
+  NOMOUNT_SETUP_URL: https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/dev/kernel/setup.sh
+  SUSFS_MIN_VERSION: 2.3.00
+  ZIP_NAME: spes-KSUN-SUSFS.zip
+  # every symbol here must exist in the KSU fork's Kconfig, otherwise Kconfig drops
+  # it silently and the feature is compiled out while the build stays green
+  SUSFS_CONFIGS: KSU KSU_SUSFS KSU_SUSFS_SUS_PATH KSU_SUSFS_SUS_MOUNT KSU_SUSFS_SUS_KSTAT KSU_SUSFS_SPOOF_UNAME KSU_SUSFS_ENABLE_LOG KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG KSU_SUSFS_OPEN_REDIRECT KSU_SUSFS_SUS_MAP KSU_SUSFS_PRIORITY_UID_FILTER THREAD_INFO_IN_TASK
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          df -h /
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git curl bc bison flex libssl-dev libelf-dev device-tree-compiler \
+            zip unzip cpio python3 lz4 zstd ccache \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+
+      - name: Clang
+        run: |
+          git clone --depth=1 "$CLANG_URL" "$HOME/clang"
+          echo "$HOME/clang/bin" >> "$GITHUB_PATH"
+
+      - name: KernelSU-Next (floating or pinned)
+        env:
+          KSU_REF: ${{ inputs.ksu_ref }}
+        run: |
+          set -o pipefail
+          ref="${KSU_REF:-dev-susfs}"
+          curl -fsSL "$KSU_SETUP_URL" | bash -s "$ref"
+          [ "$(git -C KernelSU-Next rev-parse --abbrev-ref HEAD)" != "HEAD" ] || git -C KernelSU-Next checkout -q "$ref"
+          grep -q KSU_SUSFS_PRIORITY_UID_FILTER KernelSU-Next/kernel/Kconfig
+          grep -q CMD_SUSFS_SET_PRIORITY_UID_FILTER KernelSU-Next/kernel/supercall/dispatch.c
+          echo "KSU_VER=$(git -C KernelSU-Next rev-parse --short HEAD) ($ref)" >> "$GITHUB_ENV"
+
+      - name: KernelSU 4.19 compat headers
+        run: |
+          # dev-susfs assumes the >=5.10 header split; both symbols live in kernel.h here
+          printf '#ifndef _LINUX_MINMAX_H\n#define _LINUX_MINMAX_H\n#include <linux/kernel.h>\n#endif\n' > include/linux/minmax.h
+          printf '#ifndef _LINUX_HEX_H\n#define _LINUX_HEX_H\n#include <linux/kernel.h>\n#endif\n' > include/linux/hex.h
+          ls -l include/linux/minmax.h include/linux/hex.h
+
+      - name: SUSFS (floating or pinned)
+        env:
+          JACK_COMMIT: ${{ inputs.jackaltman_commit }}
+        run: |
+          set -o pipefail
+          ref="${JACK_COMMIT:-mainline}"
+          url="$JACK_RAW/$ref/Patches/Patch/susfs_patch_to_4.19.patch"
+          curl -fsSL "$url" -o /tmp/susfs.patch
+          ver=$(sed -n 's/^+#define SUSFS_VERSION "v\([0-9.]*\)".*/\1/p' /tmp/susfs.patch | head -1)
+          echo "SUSFS $ver from $url"
+          [ -n "$ver" ] || { echo "::error::SUSFS_VERSION not found in patch"; exit 1; }
+          [ "$(printf '%s\n%s\n' "$SUSFS_MIN_VERSION" "$ver" | sort -V | head -1)" = "$SUSFS_MIN_VERSION" ] \
+            || { echo "::error::SUSFS $ver is older than $SUSFS_MIN_VERSION required by KernelSU-Next"; exit 1; }
+          echo "SUSFS_VER=$ver" >> "$GITHUB_ENV"
+          # this tree has the fs_context mount API and newer mm helpers than the
+          # upstream 4.19 patch expects, so these five files reject by design and
+          # are restored by susfs-4.19-compat.patch
+          git apply --reject /tmp/susfs.patch > /tmp/susfs-apply.log 2>&1 || true
+          echo "upstream hunks rejected (expected): $(grep -c 'patch failed' /tmp/susfs-apply.log || true)"
+          git apply susfs-4.19-compat.patch
+          for f in fs/Makefile fs/super.c mm/memory.c fs/proc/task_mmu.c fs/namespace.c; do rm -f "$f.rej"; done
+          unexpected=$(find . -name '*.rej')
+          if [ -n "$unexpected" ]; then
+            find . -name '*.rej' -exec sh -c 'echo "=== $1"; cat "$1"' _ {} \;
+            echo "::error::SUSFS patch left unexpected rejects, fix them and rerun"
+            exit 1
+          fi
+          # the compat patch must keep every rejected hunk's functionality
+          check() { grep -q "$2" "$1" || { echo "::error::$1 lost '$2' (upstream SUSFS patch drifted)"; exit 1; }; }
+          check fs/Makefile 'obj-$(CONFIG_KSU_SUSFS) += susfs.o'
+          check fs/super.c 'DEFAULT_KSU_MNT_MINOR_DEV'
+          check mm/memory.c 'SUSFS_IS_INODE_SUS_MAP'
+          check fs/proc/task_mmu.c 'SUSFS_IS_INODE_SUS_MAP'
+          check fs/namespace.c 'susfs_alloc_non_unshare_ksu_vfsmnt'
+          echo "SUSFS applied cleanly"
+
+      - name: KSU inline hooks (floating or pinned)
+        env:
+          JACK_COMMIT: ${{ inputs.jackaltman_commit }}
+        run: |
+          set -o pipefail
+          ref="${JACK_COMMIT:-mainline}"
+          curl -fsSL "$JACK_RAW/$ref/Patches/susfs_inline_hook_patches.sh" -o /tmp/hooks.sh
+          bash /tmp/hooks.sh 2>&1 | tee /tmp/hooks.log
+          if grep -q 'patch failed for unknown reasons' /tmp/hooks.log; then
+            echo "::error::inline hook script failed to patch a file"
+            exit 1
+          fi
+          hook_ver=$(sed -n 's/^PATCH_LEVEL="\([0-9.]*\)".*/\1/p' /tmp/hooks.sh | head -1)
+          [ -n "$hook_ver" ] || { echo "::error::PATCH_LEVEL not found in hooks.sh"; exit 1; }
+          echo "hooks.sh hardcoded minimum: $hook_ver (its 'Current susfs patch version' line is that minimum, not the applied version); applied SUSFS: $SUSFS_VER"
+          [ "$(printf '%s\n%s\n' "$hook_ver" "$SUSFS_VER" | sort -V | head -1)" = "$hook_ver" ] \
+            || { echo "::error::hooks.sh expects SUSFS >= $hook_ver but $SUSFS_VER is applied"; exit 1; }
+
+      - name: NoMount (floating or pinned)
+        env:
+          NOMOUNT_COMMIT: ${{ inputs.nomount_commit }}
+        run: |
+          set -o pipefail
+          curl -fsSL "$NOMOUNT_SETUP_URL" | bash -s "$NOMOUNT_COMMIT"
+          if [ -n "$NOMOUNT_COMMIT" ]; then
+            [ "$(git -C NoMount rev-parse HEAD)" = "$(git -C NoMount rev-parse "$NOMOUNT_COMMIT^{commit}")" ] \
+              || { echo "::error::NoMount is not at $NOMOUNT_COMMIT"; exit 1; }
+          fi
+          echo "NOMOUNT_VER=$(git -C NoMount rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          cfg="arch/$ARCH/configs/$DEFCONFIG"
+          grep -q '^CONFIG_NOMOUNT=' "$cfg" || echo "CONFIG_NOMOUNT=y" >> "$cfg"
+
+      - name: Defconfig
+        run: |
+          cfg="arch/$ARCH/configs/$DEFCONFIG"
+          for c in $SUSFS_CONFIGS; do
+            grep -q "^CONFIG_$c=" "$cfg" || echo "CONFIG_$c=y" >> "$cfg"
+          done
+          tail -n 20 "$cfg"
+
+      - name: Build
+        run: |
+          set -o pipefail
+          M="O=out ARCH=$ARCH CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
+          make $M "$DEFCONFIG"
+          for c in $SUSFS_CONFIGS NOMOUNT; do
+            grep -q "^CONFIG_$c=y" out/.config || { echo "::error::CONFIG_$c did not survive Kconfig (undefined symbol?)"; exit 1; }
+          done
+          make $M -j"$(nproc)" 2>&1 | tee build.log
+
+      - name: Upload build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+
+      - name: Pack AnyKernel3
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3
+          boot="out/arch/$ARCH/boot"
+          img="$boot/Image.gz-dtb"
+          if [ ! -f "$img" ]; then
+            gz="$boot/Image.gz"
+            if [ ! -f "$gz" ]; then
+              gzip -c "$boot/Image" > /tmp/Image.gz
+              gz=/tmp/Image.gz
+            fi
+            if [ -f "$boot/dtb.img" ]; then
+              cat "$gz" "$boot/dtb.img" > /tmp/Image.gz-dtb
+            else
+              dtb=$(find "$boot/dts" -name "$CHIP.dtb" | head -1)
+              [ -n "$dtb" ] || { echo "::error::no dtb in build output"; exit 1; }
+              cat "$gz" "$dtb" > /tmp/Image.gz-dtb
+            fi
+            img=/tmp/Image.gz-dtb
+          fi
+          cp "$img" ak3/
+          if [ -f "$boot/dtbo.img" ]; then
+            cp "$boot/dtbo.img" ak3/
+          else
+            echo "::warning::dtbo.img missing, leaving the device dtbo untouched"
+          fi
+          ls -l ak3/Image.gz-dtb ak3/dtbo.img 2>/dev/null || true
+          cat > ak3/anykernel.sh <<'AK3'
+          properties() { '
+          kernel.string=KernelSU-Next + SUSFS 4.19
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=spes
+          device.name2=spesn
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; }
+
+          BLOCK=/dev/block/bootdevice/by-name/boot;
+          IS_SLOT_DEVICE=0;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          . tools/ak3-core.sh;
+          dump_boot;
+          write_boot;
+          AK3
+          cd ak3
+          zip -qr9 "../$ZIP_NAME" . -x '.git*' 'README.md' '*placeholder'
+          cd ..
+          ls -lh "$ZIP_NAME"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.DEVICE }}-KSUN-SUSFS
+          path: ${{ env.ZIP_NAME }}
+
+      - name: Summary
+        if: always()
+        run: |
+          kver=$(sed -n 's/^#define UTS_RELEASE "\(.*\)"/\1/p' out/include/generated/utsrelease.h 2>/dev/null || true)
+          size=$(du -h "$ZIP_NAME" 2>/dev/null | cut -f1 || true)
+          {
+            echo "### $DEVICE build"
+            echo ""
+            echo "- kernel: ${kver:-unknown} @ ${GITHUB_SHA::7}"
+            echo "- KernelSU: KernelSU-Next ${KSU_VER:-unknown}"
+            echo "- SUSFS: v${SUSFS_VER:-unknown} (min $SUSFS_MIN_VERSION, ref: ${{ inputs.jackaltman_commit || 'mainline' }})"
+            echo "- NoMount: ${NOMOUNT_VER:-unknown} (ref: ${{ inputs.nomount_commit || 'dev' }})"
+            echo "- artifact: $ZIP_NAME ${size:-not built}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Release
+        if: inputs.release == true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="spes-$(date -u +%Y%m%d-%H%M)-${GITHUB_SHA::7}"
+          gh release create "$TAG" "$ZIP_NAME" --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" --notes "KernelSU-Next ${KSU_VER:-unknown} + SUSFS v${SUSFS_VER:-unknown} @ kernel ${GITHUB_SHA::7}"
