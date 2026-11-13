@@ -94,7 +94,7 @@ jobs:
           # dev-susfs assumes the >=5.10 header split; both symbols live in kernel.h here
           printf '#ifndef _LINUX_MINMAX_H\n#define _LINUX_MINMAX_H\n#include <linux/kernel.h>\n#endif\n' > include/linux/minmax.h
           printf '#ifndef _LINUX_HEX_H\n#define _LINUX_HEX_H\n#include <linux/kernel.h>\n#endif\n' > include/linux/hex.h
-          python3 ksun-4.19-compat.py KernelSU-Next/kernel/infra/file_wrapper.c
+          python3 ksun-4.19-compat.py KernelSU-Next
           grep -c 'KERNEL_VERSION(5, 4, 0)' KernelSU-Next/kernel/infra/file_wrapper.c
 
       - name: SUSFS (floating or pinned)
