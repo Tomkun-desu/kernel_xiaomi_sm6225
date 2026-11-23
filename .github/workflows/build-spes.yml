@@ -11,11 +11,11 @@ on:
       bakasu_commit:
         description: 'BakaSU commit/tag (empty = latest main)'
         required: false
-        default: '548d1dda060ca198823d8808804d01f5209ef4a9'
+        default: ''
       jackaltman_commit:
         description: 'JackA1ltman/NonGKI_Kernel_Build_2nd commit/tag for patch+hooks (empty = latest mainline)'
         required: false
-        default: 'e34397912802b6d8f07aeb6ebfd475eb5d841dfe'
+        default: ''
       nomount_commit:
         description: 'NoMount commit/tag (empty = latest dev)'
         required: false
@@ -92,9 +92,7 @@ jobs:
 
       - name: KernelSU (floating or pinned)
         env:
-          # push/schedule runs get no input defaults, so pin them there;
-          # a dispatch run with an empty field still means "latest"
-          BAKASU_COMMIT: ${{ github.event_name != 'workflow_dispatch' && '548d1dda060ca198823d8808804d01f5209ef4a9' || inputs.bakasu_commit }}
+          BAKASU_COMMIT: ${{ inputs.bakasu_commit }}
         run: |
           set -o pipefail
           curl -fsSL "$KSU_SETUP_URL" | bash -s "$BAKASU_COMMIT"
@@ -106,17 +104,20 @@ jobs:
           fi
           echo "KSU_VER=$(git -C KernelSU rev-parse --short HEAD)" >> "$GITHUB_ENV"
 
-      - name: KSU patch (priority uid filter)
+      - name: KSU check (priority uid filter must come from BakaSU itself)
         run: |
-          git -C KernelSU apply --verbose ../ksu-priority-uid-filter.patch
-          grep -q KSU_SUSFS_PRIORITY_UID_FILTER KernelSU/kernel/Kconfig
-          grep -q CMD_SUSFS_SET_PRIORITY_UID_FILTER KernelSU/kernel/supercall/dispatch.c
-          echo "0x60030 dispatch added to BakaSU"
+          # BakaSU ships the feature; the kernel side lives in the SUSFS patch.
+          # a pinned copy of the old patch is gone on purpose: it breaks on every upstream commit.
+          grep -q 'config KSU_SUSFS_PRIORITY_UID_FILTER' KernelSU/kernel/Kconfig \
+            || { echo "::error::BakaSU dropped KSU_SUSFS_PRIORITY_UID_FILTER"; exit 1; }
+          grep -q 'CMD_SUSFS_SET_PRIORITY_UID_FILTER' KernelSU/kernel/supercall/dispatch.c \
+            || { echo "::error::BakaSU dropped the 0x60030 dispatch case"; exit 1; }
+          echo "BakaSU carries the 0x60030 dispatch case"
 
       - name: SUSFS (floating or pinned)
         env:
-          # same reason as above: push/schedule fall back to the pinned SUSFS tree
-          JACK_COMMIT: ${{ github.event_name != 'workflow_dispatch' && 'e34397912802b6d8f07aeb6ebfd475eb5d841dfe' || inputs.jackaltman_commit }}
+          # same reason: a dispatch run with an empty field means "latest"
+          JACK_COMMIT: ${{ inputs.jackaltman_commit }}
         run: |
           set -o pipefail
           ref="${JACK_COMMIT:-mainline}"
@@ -158,16 +159,20 @@ jobs:
           git apply --verbose susfs-priority-uid-filter-defer.patch
           [ "$(grep -c 'schedule_work(&susfs_priority_app_strings_work)' fs/susfs.c)" = "1" ] \
             || { echo "::error::priority uid filter workqueue hook missing"; exit 1; }
-          [ "$(grep -c 'orig_cred = susfs_switch_to_ksu_domain();' fs/susfs.c)" = "1" ] \
-            || { echo "::error::creds switch still runs inline in the syscall hook"; exit 1; }
           [ "$(grep -c 'strncpy_from_user(app_buf' fs/susfs.c)" = "1" ] \
             || { echo "::error::priority uid filter string copy missing"; exit 1; }
+          # upstream calls susfs_switch_to_ksu_domain() from several features, so the
+          # check is scoped to the setter: the creds switch must not run in the syscall hook
+          body=$(awk '/^void susfs_set_priority_uid_filter\(void __user/{f=1} f{print} f&&/^}/{exit}' fs/susfs.c)
+          [ -n "$body" ] || { echo "::error::susfs_set_priority_uid_filter not found"; exit 1; }
+          case "$body" in
+            *susfs_switch_to_ksu_domain*) echo "::error::creds switch still runs inline in the syscall hook"; exit 1;;
+          esac
           echo "priority uid filter resolve deferred to a workqueue"
 
       - name: KSU inline hooks (floating or pinned)
         env:
-          # same reason as above: push/schedule fall back to the pinned SUSFS tree
-          JACK_COMMIT: ${{ github.event_name != 'workflow_dispatch' && 'e34397912802b6d8f07aeb6ebfd475eb5d841dfe' || inputs.jackaltman_commit }}
+          JACK_COMMIT: ${{ inputs.jackaltman_commit }}
         run: |
           set -o pipefail
           ref="${JACK_COMMIT:-mainline}"
