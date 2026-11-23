@@ -21,19 +21,22 @@ on:
         required: false
         default: ''
       droidspace:
-        description: 'Droidspaces (Linux containers) support: config fragment + non-GKI cgroup patch'
+        description: 'Droidspaces (Linux containers) support: config + non-GKI patches from Droidspaces-OSS'
         type: choice
         options:
           - 'no'
           - 'yes'
         required: false
         default: 'no'
+      droidspace_commit:
+        description: 'Droidspaces-OSS commit/tag for the non-GKI patches + kernel config (empty = latest main)'
+        required: false
+        default: ''
   push:
     branches: [bka]
     paths:
       - '.github/workflows/build-spes.yml'
       - 'susfs-4.19-compat.patch'
-      - 'droidspaces/**'
   schedule:
     - cron: '0 2 * * 1'
 
@@ -53,6 +56,7 @@ env:
   CLANG_URL: https://github.com/kdrag0n/proton-clang.git
   CHIP: khaje
   NOMOUNT_SETUP_URL: https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/dev/kernel/setup.sh
+  DROIDSPACE_REPO: https://github.com/ravindu644/Droidspaces-OSS.git
   SUSFS_MIN_VERSION: 2.3.00
   ZIP_NAME: spes-BakaSU-SUSFS${{ inputs.droidspace == 'yes' && '-droidspaces' || '' }}.zip
   # every symbol here must exist in BakaSU's Kconfig, otherwise Kconfig drops
@@ -193,19 +197,49 @@ jobs:
           cfg="arch/$ARCH/configs/$DEFCONFIG"
           grep -q '^CONFIG_NOMOUNT=' "$cfg" || echo "CONFIG_NOMOUNT=y" >> "$cfg"
 
-      - name: Droidspaces (container support, optional)
+      - name: Droidspaces (container support, optional, floating)
         if: inputs.droidspace == 'yes'
+        env:
+          DROIDSPACE_COMMIT: ${{ inputs.droidspace_commit }}
         run: |
-          # non-GKI doc: https://github.com/ravindu644/Droidspaces-OSS/blob/main/Documentation/Kernel-Configuration.md
-          # xt_qtaguid patch from that doc is not shipped here: the file does not exist in this tree
-          git apply --verbose droidspaces/0001-cgroup-restore-file-prefix.patch
-          grep -q 'kernfs_create_link(cgrp->kn, name, kn);' kernel/cgroup/cgroup.c \
-            || { echo "::error::cgroup file prefix patch did not land"; exit 1; }
+          set -o pipefail
+          # kernel config + patches are read live from Droidspaces-OSS, like BakaSU/SUSFS
+          ds="$RUNNER_TEMP/droidspaces"
+          git clone -q --depth=1 --filter=blob:none --sparse "$DROIDSPACE_REPO" "$ds"
+          git -C "$ds" sparse-checkout set Documentation
+          if [ -n "$DROIDSPACE_COMMIT" ]; then
+            git -C "$ds" fetch -q origin "$DROIDSPACE_COMMIT" 2>/dev/null || true
+            git -C "$ds" checkout -q --detach "$DROIDSPACE_COMMIT"
+            [ "$(git -C "$ds" rev-parse HEAD)" = "$(git -C "$ds" rev-parse "$DROIDSPACE_COMMIT^{commit}")" ] \
+              || { echo "::error::Droidspaces-OSS is not at $DROIDSPACE_COMMIT"; exit 1; }
+          fi
+          echo "DROIDSPACE_VER=$(git -C "$ds" rev-parse --short HEAD)" >> "$GITHUB_ENV"
+
+          # non-GKI doc step 3: every patch under that folder, skipped when its
+          # target does not exist here (01 patches xt_qtaguid, absent in this tree)
+          patched=0
+          for p in "$ds"/Documentation/resources/kernel-patches/non-GKI/*.patch; do
+            files=$(sed -n 's|^diff --git a/\([^ ]*\).*|\1|p' "$p")
+            here=0
+            for f in $files; do [ -e "$f" ] && here=1; done
+            if [ "$here" = 0 ]; then echo "skip $(basename "$p"): target not in this tree"; continue; fi
+            git apply --verbose "$p" || { echo "::error::$(basename "$p") failed to apply"; exit 1; }
+            patched=$((patched + 1))
+          done
+          [ "$patched" -ge 1 ] || { echo "::error::no Droidspaces patch applied"; exit 1; }
+          git diff --quiet && { echo "::error::Droidspaces patches changed nothing"; exit 1; }
+
+          # non-GKI doc step 1: the first makefile block of that page
           cfg="arch/$ARCH/configs/$DEFCONFIG"
-          cat droidspaces/droidspaces.fragment >> "$cfg"
+          frag=$(awk '/^```makefile/{f=1;next} f&&/^```/{exit} f' "$ds/Documentation/Kernel-Configuration.md" \
+                 | sed 's/^CONFIG_\([A-Z0-9_]*\)=n$/# CONFIG_\1 is not set/' \
+                 | grep -v '^CONFIG_DEVTMPFS_MOUNT=')   # android init owns /dev, mounting it here risks boot
+          lines=$(printf '%s\n' "$frag" | grep -c '^CONFIG_')
+          [ "$lines" -ge 20 ] || { echo "::error::config block in the doc looks wrong ($lines lines)"; exit 1; }
+          printf '%s\n' "$frag" >> "$cfg"
+          echo "fragment: $lines lines appended to $cfg, $patched patch(es) applied"
           # build step fails the run if any of these is dropped by Kconfig
           echo "DROIDSPACE_CONFIGS=PID_NS UTS_NS IPC_NS USER_NS SYSVIPC POSIX_MQUEUE DEVTMPFS CGROUP_DEVICE CGROUP_PIDS CFS_BANDWIDTH VETH MACVLAN NF_NAT IP6_NF_NAT NF_NAT_REDIRECT" >> "$GITHUB_ENV"
-          echo "Droidspaces config fragment appended to $cfg"
 
       - name: Defconfig
         run: |
@@ -307,7 +341,7 @@ jobs:
             echo "- KernelSU: BakaSU ${KSU_VER:-unknown} (ref: ${{ inputs.bakasu_commit || 'main' }})"
             echo "- SUSFS: v${SUSFS_VER:-unknown} (min $SUSFS_MIN_VERSION, ref: ${{ inputs.jackaltman_commit || 'mainline' }})"
             echo "- NoMount: ${NOMOUNT_VER:-unknown} (ref: ${{ inputs.nomount_commit || 'dev' }})"
-            echo "- Droidspaces: ${{ inputs.droidspace || 'no' }}"
+            echo "- Droidspaces: ${{ inputs.droidspace || 'no' }} ${DROIDSPACE_VER:-}"
             echo "- artifact: $ZIP_NAME ${size:-not built}"
           } >> "$GITHUB_STEP_SUMMARY"
 
