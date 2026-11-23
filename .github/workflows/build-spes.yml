@@ -9,9 +9,13 @@ on:
         required: false
         default: false
       bakasu_commit:
-        description: 'BakaSU commit/tag (empty = latest main)'
+        description: 'BakaSU commit/tag (empty = pinned default; use main for latest)'
         required: false
-        default: ''
+        # 0799a678 is the last BakaSU commit before its SELinux policy rewrite.
+        # every newer one breaks exec and su on this 4.19 tree: Termux, droidspaces
+        # and root shells get EACCES while the manager still reports Working.
+        # re-test after upstream fixes it: dispatch with bakasu_commit=main
+        default: '0799a6787d148a17283416ca4a0163b41b4b13ad'
       jackaltman_commit:
         description: 'JackA1ltman/NonGKI_Kernel_Build_2nd commit/tag for patch+hooks (empty = latest mainline)'
         required: false
