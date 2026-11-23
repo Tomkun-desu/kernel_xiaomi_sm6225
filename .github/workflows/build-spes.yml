@@ -88,7 +88,9 @@ jobs:
 
       - name: KernelSU (floating or pinned)
         env:
-          BAKASU_COMMIT: ${{ inputs.bakasu_commit }}
+          # push/schedule runs get no input defaults, so pin them there;
+          # a dispatch run with an empty field still means "latest"
+          BAKASU_COMMIT: ${{ github.event_name != 'workflow_dispatch' && '548d1dda060ca198823d8808804d01f5209ef4a9' || inputs.bakasu_commit }}
         run: |
           set -o pipefail
           curl -fsSL "$KSU_SETUP_URL" | bash -s "$BAKASU_COMMIT"
@@ -109,7 +111,8 @@ jobs:
 
       - name: SUSFS (floating or pinned)
         env:
-          JACK_COMMIT: ${{ inputs.jackaltman_commit }}
+          # same reason as above: push/schedule fall back to the pinned SUSFS tree
+          JACK_COMMIT: ${{ github.event_name != 'workflow_dispatch' && 'e34397912802b6d8f07aeb6ebfd475eb5d841dfe' || inputs.jackaltman_commit }}
         run: |
           set -o pipefail
           ref="${JACK_COMMIT:-mainline}"
@@ -159,7 +162,8 @@ jobs:
 
       - name: KSU inline hooks (floating or pinned)
         env:
-          JACK_COMMIT: ${{ inputs.jackaltman_commit }}
+          # same reason as above: push/schedule fall back to the pinned SUSFS tree
+          JACK_COMMIT: ${{ github.event_name != 'workflow_dispatch' && 'e34397912802b6d8f07aeb6ebfd475eb5d841dfe' || inputs.jackaltman_commit }}
         run: |
           set -o pipefail
           ref="${JACK_COMMIT:-mainline}"
